@@ -5487,6 +5487,35 @@ def test_sfn_aws_sdk_s3_op_specs_cover_issue_573_request():
 
     assert "ListObjectsV2" in _S3_OP_SPECS
     assert "CopyObject" in _S3_OP_SPECS
+
+
+def test_sfn_aws_sdk_s3_error_is_service_prefixed(sfn_sync):
+    """A failing rest-xml op keeps its service prefix now that it is no longer hardcoded."""
+    tag = _uuid_mod.uuid4().hex[:8]
+
+    sm_arn = sfn_sync.create_state_machine(
+        name=f"sdk-s3-err-{tag}",
+        definition=json.dumps({
+            "StartAt": "Del",
+            "States": {
+                "Del": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:s3:deleteBucket",
+                    "Parameters": {"Bucket": f"absent-{tag}"},
+                    "End": True,
+                },
+            },
+        }),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({}))
+        assert resp["status"] == "FAILED"
+        assert (resp.get("error") or "").startswith("S3."), resp.get("error")
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 # ---------------------------------------------------------------------------
 # Terraform compatibility tests
 # ---------------------------------------------------------------------------
