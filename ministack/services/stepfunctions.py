@@ -4222,12 +4222,14 @@ _EC2_FIELDS_BY_PARENT = {
     ("ipPermissionsEgress", "groups"): "UserIdGroupPairs",
     ("productCodes", "productCode"): "ProductCodeId",
     ("productCodes", "type"): "ProductCodeType",
+    ("snapshotSet", "status"): "State",
     ("volumeSet", "status"): "State",
 }
 
 # EC2 reuses some names depending on action. Special case for flattening
 _EC2_FIELDS_BY_ACTION = {
     ("AttachVolume", "status"): "State",
+    ("CreateSnapshot", "status"): "State",
     ("CreateVolume", "status"): "State",
     ("DetachVolume", "status"): "State",
     ("StartInstances", "instancesSet"): "StartingInstances",
