@@ -2283,6 +2283,28 @@ def test_sfn_aws_sdk_ec2_describe_volumes_returns_sdk_shape(sfn_sync, ec2):
             ec2.delete_volume(VolumeId=volume_id)
 
 
+def test_sfn_aws_sdk_ec2_snapshots_return_state(sfn_sync, ec2):
+    """aws-sdk:ec2:createSnapshot and describeSnapshots return State, not Status."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    az = ec2.describe_availability_zones()["AvailabilityZones"][0]["ZoneName"]
+    volume_id = ec2.create_volume(AvailabilityZone=az, Size=1)["VolumeId"]
+    snapshot_id = None
+    try:
+        made = _run_sdk_task(sfn_sync, f"sdk-snap-new-{suffix}", "ec2:createSnapshot", {"VolumeId": volume_id})
+        snapshot_id = made["SnapshotId"]
+        assert made["State"] == "completed"
+        assert "Status" not in made
+
+        result = _run_sdk_task(sfn_sync, f"sdk-snap-{suffix}", "ec2:describeSnapshots", {"SnapshotIds": [snapshot_id]})
+        snapshot = result["Snapshots"][0]
+        assert snapshot["State"] == "completed"
+        assert "Status" not in snapshot
+    finally:
+        if snapshot_id:
+            ec2.delete_snapshot(SnapshotId=snapshot_id)
+        ec2.delete_volume(VolumeId=volume_id)
+
+
 def test_sfn_aws_sdk_ec2_instances_return_sdk_shape(sfn_sync, ec2):
     """runInstances/describeInstances return Instances[0].State.Name, not InstanceState."""
     suffix = _uuid_mod.uuid4().hex[:8]
