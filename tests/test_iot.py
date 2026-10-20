@@ -1183,6 +1183,105 @@ def test_iot_tagging_refuses_unknown_and_foreign_arns(iot_client):
         assert _iot_error(iot_client.list_tags_for_resource, resourceArn=target) == (400, message)
 
 
+@pytest.mark.auth_contract
+def test_iot_tagging_authorizes_on_the_resource_arn(auth_enabled, iam_user, iot_client):
+    allowed, other = (iot_client.create_thing_group(thingGroupName=_unique("group"))["thingGroupArn"]
+                      for _ in range(2))
+    iot_client.tag_resource(resourceArn=other, tags=[{"Key": "existing", "Value": "before"}])
+    thing_type = allowed.rsplit(":", 1)[0] + ":thingtype/" + _unique("type")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": ["iot:TagResource", "iot:UntagResource", "iot:ListTagsForResource"],
+        "Resource": allowed,
+    }]})
+    client = user.client("iot")
+    try:
+        client.tag_resource(resourceArn=allowed, tags=[{"Key": "k", "Value": "v"}])
+        assert client.list_tags_for_resource(resourceArn=allowed)["tags"] == [{"Key": "k", "Value": "v"}]
+        client.untag_resource(resourceArn=allowed, tagKeys=["k"])
+        assert client.list_tags_for_resource(resourceArn=allowed)["tags"] == []
+
+        for action, call, arn, kwargs in (
+            ("TagResource", client.tag_resource, other, {"tags": [{"Key": "k", "Value": "v"}]}),
+            ("UntagResource", client.untag_resource, other, {"tagKeys": ["existing"]}),
+            ("ListTagsForResource", client.list_tags_for_resource, other, {}),
+            ("ListTagsForResource", client.list_tags_for_resource, thing_type, {}),
+        ):
+            if auth_enabled:
+                with pytest.raises(ClientError) as ei:
+                    call(resourceArn=arn, **kwargs)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert error["Error"]["Code"] == "AccessDeniedException"
+                assert error["Error"]["Message"].startswith(
+                    f"User: {user.arn} is not authorized to perform: iot:{action} ")
+            else:
+                assert call(resourceArn=arn, **kwargs)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert _iot_tags(iot_client, other) == ({"existing": "before"} if auth_enabled else {"k": "v"})
+    finally:
+        for arn in (allowed, other):
+            iot_client.delete_thing_group(thingGroupName=arn.rsplit("/", 1)[1])
+
+
+@pytest.mark.auth_contract
+def test_iot_resource_tag_conditions_decide_on_the_named_resource(auth_enabled, iam_user, iot_client):
+    deletes = ["iot:DeleteThingGroup", "iot:DeletePolicy"]
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["iot:ListTagsForResource", "iot:DescribeThingGroup", "iot:GetPolicy"],
+         "Resource": "*", "Condition": {"StringEquals": {"aws:ResourceTag/env": "dev"}}},
+        {"Effect": "Allow", "Action": deletes, "Resource": "*"},
+        {"Effect": "Deny", "Action": deletes, "Resource": "*",
+         "Condition": {"StringEquals": {"aws:ResourceTag/env": "prod"}}},
+    ]})
+    client = user.client("iot")
+    document = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]})
+    names = {env: _unique(f"rt-{env}") for env in ("dev", "prod", "untagged")}
+    groups, policies = {}, {}
+    for env, name in names.items():
+        tags = {} if env == "untagged" else {"tags": [{"Key": "env", "Value": env}]}
+        groups[env] = iot_client.create_thing_group(thingGroupName=name, **tags)["thingGroupArn"]
+        policies[env] = iot_client.create_policy(policyName=name, policyDocument=document, **tags)["policyArn"]
+    no_allow = "because no identity-based policy allows the {} action"
+    explicit_deny = "with an explicit deny in an identity-based policy"
+    try:
+        client.describe_thing_group(thingGroupName=names["dev"])
+        client.get_policy(policyName=names["dev"])
+        client.list_tags_for_resource(resourceArn=policies["dev"])
+
+        for call, action, resource, reason, kwargs in (
+            (client.describe_thing_group, "DescribeThingGroup", groups["prod"], no_allow,
+             {"thingGroupName": names["prod"]}),
+            (client.describe_thing_group, "DescribeThingGroup", groups["untagged"], no_allow,
+             {"thingGroupName": names["untagged"]}),
+            (client.get_policy, "GetPolicy", policies["prod"], no_allow, {"policyName": names["prod"]}),
+            (client.list_thing_groups, "ListThingGroups", "*", no_allow, {}),
+            (client.delete_thing_group, "DeleteThingGroup", groups["prod"], explicit_deny,
+             {"thingGroupName": names["prod"]}),
+            (client.delete_policy, "DeletePolicy", policies["prod"], explicit_deny, {"policyName": names["prod"]}),
+        ):
+            if auth_enabled:
+                with pytest.raises(ClientError) as ei:
+                    call(**kwargs)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert error["Error"]["Code"] == "AccessDeniedException"
+                assert error["Error"]["Message"] == (
+                    f"User: {user.arn} is not authorized to perform: iot:{action} on resource: {resource} "
+                    + reason.format(f"iot:{action}"))
+            else:
+                assert call(**kwargs)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        client.delete_thing_group(thingGroupName=names["untagged"])
+        client.delete_policy(policyName=names["untagged"])
+    finally:
+        for name in names.values():
+            for call, kwargs in ((iot_client.delete_thing_group, {"thingGroupName": name}),
+                                 (iot_client.delete_policy, {"policyName": name})):
+                try:
+                    call(**kwargs)
+                except ClientError:
+                    pass
+
+
 def test_iot_tag_limits_and_validation(iot_client):
     from conftest import make_client
 
@@ -2614,8 +2713,10 @@ async def _fleet_client(
     send, sent = _mock_send()
     session = _IoTWSSession(send, account, region, certificate_id)
     await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
-    filters = [f"{_FLEET_CREATE}/+"] + [
-        f"$aws/provisioning-templates/{t}/provision/json/+" for t in templates
+    filters = [
+        f"{topic}/{reply}"
+        for topic in [_FLEET_CREATE, *map(_fleet_provision_topic, templates)]
+        for reply in ("accepted", "rejected")
     ]
     await session.handle_packet(
         PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [(f, 1) for f in filters])
@@ -3999,6 +4100,62 @@ def test_iot_topic_rule_duplicate_rejected(iot_client):
         iot_client.create_topic_rule(ruleName=name, topicRulePayload=payload)
     assert ei.value.response["Error"]["Code"] == "ResourceAlreadyExistsException"
     iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_topic_rule_name_refused_by_pattern_and_length():
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    long_name, long_dash = "r" * 129, "bad-" + "r" * 125
+    pattern = "Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    length = "Member must have length less than or equal to 128"
+    cases = (
+        ("bad-name", f"1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+                     f"constraint: {pattern}"),
+        (long_name, f"1 validation error detected: Value '{long_name}' at 'ruleName' failed to satisfy "
+                    f"constraint: {length}"),
+        (long_dash, f"2 validation errors detected: Value '{long_dash}' at 'ruleName' failed to satisfy "
+                    f"constraint: {pattern}; Value '{long_dash}' at 'ruleName' failed to satisfy "
+                    f"constraint: {length}"),
+    )
+    for name, message in cases:
+        calls = (
+            lambda: raw.create_topic_rule(
+                ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+            ),
+            lambda: raw.get_topic_rule(ruleName=name),
+            lambda: raw.disable_topic_rule(ruleName=name),
+        )
+        for call in calls:
+            with pytest.raises(ClientError) as ei:
+                call()
+            err = ei.value.response
+            assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+                400, "InvalidRequestException", message)
+    assert not [r for r in raw.list_topic_rules()["rules"] if r["ruleName"] in (long_name, long_dash)]
+
+
+def test_iot_topic_rule_name_with_trailing_newline_refused(iot_client):
+    name = _rule_name() + "\n"
+    message = (
+        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    )
+    calls = (
+        lambda: iot_client.create_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.get_topic_rule(ruleName=name),
+        lambda: iot_client.delete_topic_rule(ruleName=name),
+        lambda: iot_client.enable_topic_rule(ruleName=name),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException", message)
+    assert name not in [r["ruleName"] for r in iot_client.list_topic_rules()["rules"]]
 
 
 def test_iot_replace_topic_rule(iot_client):

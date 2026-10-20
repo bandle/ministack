@@ -95,7 +95,7 @@ from urllib.parse import parse_qs, parse_qsl
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.iam_evaluator import EvalContext, evaluate, parse_policy_document
+from ministack.core.iam_evaluator import AuthError, EvalContext, ResolvedCredential, evaluate, parse_policy_document
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -5787,12 +5787,8 @@ def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tu
 
 def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> tuple:
     """CreateTopicRule; its tags arrive as the ``x-amz-tagging`` header, ``k1=v1&k2=v2``."""
-    if not _RULE_NAME_RE.match(name or ""):
-        return error_response_json(
-            "InvalidRequestException",
-            "Invalid ruleName: must match [a-zA-Z0-9_]{1,128}",
-            400,
-        )
+    if not _RULE_NAME_RE.fullmatch(name or ""):
+        return _error_rule_name(name or "")
     if name in _topic_rules:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Rule {name!r} already exists", 409
@@ -5827,16 +5823,21 @@ def _error_rule_denied(name: str) -> tuple:
 
 
 def _error_rule_name(name: str) -> tuple:
-    return error_response_json(
-        "InvalidRequestException",
-        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
-        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
-        400,
+    """The 400 for a rule name outside the pattern, longer than 128, or both."""
+    failed = []
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", name):
+        failed.append("satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
+    if len(name) > 128:
+        failed.append("have length less than or equal to 128")
+    detail = "; ".join(
+        f"Value '{name}' at 'ruleName' failed to satisfy constraint: Member must {c}" for c in failed
     )
+    count = "1 validation error" if len(failed) == 1 else f"{len(failed)} validation errors"
+    return error_response_json("InvalidRequestException", f"{count} detected: {detail}", 400)
 
 
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
@@ -5850,7 +5851,7 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
 
 
 def _get_topic_rule(name: str) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
@@ -5860,7 +5861,7 @@ def _get_topic_rule(name: str) -> tuple:
 
 def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
     """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
@@ -5870,7 +5871,7 @@ def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
 
 
 def _delete_topic_rule(name: str) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
@@ -6726,11 +6727,12 @@ def _job_document_s3_location(source: str) -> tuple[str, str]:
 
 
 def _job_document_is_json(document: str) -> bool:
-    """Whether a job document is JSON nested no deeper than AWS accepts."""
+    """Whether a job document is JSON (NaN and Infinity are not) nested no deeper than AWS accepts."""
     from ministack.services.apigateway_v1 import _json_depth
+    from ministack.services.eventbridge import _reject_json_constant
 
     try:
-        value = json.loads(document)
+        value = json.loads(document, parse_constant=_reject_json_constant)
     except (ValueError, RecursionError):
         return False
     return _json_depth(value) <= _JOB_DOCUMENT_MAX_DEPTH
@@ -7788,14 +7790,12 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
     # the jobId beside it (JobExecutionSummaryForThing).
     summaries = []
     # A rejoined thing's executions of one job come newest first, as on AWS.
-    executions = [
-        execution
-        for latest in _job_executions.values()
-        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
-    ]
+    # Time out only this thing's executions, all of them before any is read, so the page agrees with itself.
+    latest_executions = [e for e in list(_job_executions.values()) if e["thingName"] == thing]
+    for latest in latest_executions:
+        _jobs_apply_timeout(latest)
+    executions = [execution for latest in latest_executions for execution in _jobs_with_history(latest)]
     for execution in executions:
-        if execution["thingName"] != thing:
-            continue
         if wanted_status and execution["status"] != wanted_status:
             continue
         if wanted_job and execution["jobId"] != wanted_job:
@@ -7844,11 +7844,13 @@ def _list_job_executions_for_job(job_id: str, qp: dict) -> tuple:
             "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
         )
     _jobs_materialize_executions(job_id)
+    latest_executions = [e for e in list(_job_executions.values()) if e["jobId"] == job_id]
+    for latest in latest_executions:
+        _jobs_apply_timeout(latest)
     executions = [
         execution
-        for latest in _job_executions.values()
-        if latest["jobId"] == job_id
-        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
+        for latest in latest_executions
+        for execution in _jobs_with_history(latest)
         if status is None or execution["status"] == status
     ]
     executions.sort(key=lambda e: e["lastUpdatedAt"], reverse=True)
@@ -7929,7 +7931,7 @@ async def _cancel_job_execution(
         )
     prev_next = jobs_first_pending_job_id(thing)
     execution["status"] = "CANCELED"
-    if payload.get("statusDetails"):
+    if isinstance(payload.get("statusDetails"), dict):
         execution["statusDetails"] = dict(payload["statusDetails"])
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
@@ -8064,7 +8066,7 @@ def jobs_start_next_execution(
         execution["startedAt"] = now
         execution["lastUpdatedAt"] = now
         execution["versionNumber"] += 1
-        if status_details:
+        if isinstance(status_details, dict):
             execution["statusDetails"] = dict(status_details)
     return dict(execution)
 
@@ -8348,6 +8350,15 @@ def _jobs_mqtt_json(value) -> str:
     return _jobs_device_json(value)
 
 
+def _jobs_status_details_error(status_details):
+    """InvalidRequestException unless statusDetails is a map of non-empty strings, as the DetailsMap shape is."""
+    if status_details is None or (isinstance(status_details, dict) and all(
+            isinstance(k, str) and k and isinstance(v, str) and v for k, v in status_details.items())):
+        return None
+    return error_response_json(
+        "InvalidRequestException", "statusDetails must be a map of non-empty string keys to non-empty strings", 400)
+
+
 def jobs_update_execution(
     thing_name: str,
     job_id: str,
@@ -8366,6 +8377,8 @@ def jobs_update_execution(
     `execution_number` (404), stale or non-numeric `expectedVersion`, and an
     already-terminal execution. A successful update may complete the job.
     """
+    if error := _jobs_status_details_error(status_details):
+        return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
@@ -8612,6 +8625,21 @@ def _metadata_for_delta(delta: dict, desired_meta: dict) -> dict:
 
 def _shadow_error(status: int, message: str) -> tuple:
     return status, {"message": message}
+
+
+def _shadow_number(text: str):
+    """A JSON number with a fraction or exponent; one beyond a double's range is stored as AWS stores it."""
+    value = float(text)
+    if math.isfinite(value):
+        return value
+    return "Infinity" if value > 0 else "-Infinity"
+
+
+def parse_shadow_request(payload):
+    """A shadow request payload as AWS reads it; ValueError when it is not JSON (NaN and Infinity are not)."""
+    from ministack.services.eventbridge import _reject_json_constant
+
+    return json.loads(payload, parse_constant=_reject_json_constant, parse_float=_shadow_number)
 
 
 def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tuple:
@@ -8958,11 +8986,8 @@ def _validate_publish_topic(topic: str) -> bool:
     return True
 
 
-# The reserved topic space a client may publish into. AWS closes the connection
-# of an MQTT client that publishes to any other topic starting with ``$``
-# (measured for ``$aws/events/...``, ``$aws/jobs/...`` and ``$foo/...``; a
-# publish under ``$aws/rules/`` and ``$aws/things/`` is acknowledged). The HTTPS
-# Publish in iot_data.py applies the same list and answers 400.
+# The reserved topic families an HTTPS Publish may write into; iot_data.py
+# answers 400 for any other topic starting with ``$``.
 RESERVED_PUBLISH_PREFIXES = (
     "$aws/rules/",
     "$aws/things/",
@@ -8972,9 +8997,41 @@ RESERVED_PUBLISH_PREFIXES = (
     "$aws/commands/",
 )
 
+# Over MQTT a client may publish anywhere under $aws/rules/ and $aws/things/
+# except to the replies and notifications AWS IoT itself writes there, and
+# elsewhere in the reserved space only to the request topics below.
+_RESERVED_REPLY_TOPIC_RE = re.compile(
+    r"\$aws/things/[^/]+/(jobs/((get|start-next|[^/]+/(get|update))/(accepted|rejected)|notify|notify-next)"
+    r"|defender/metrics/[^/]+/(accepted|rejected)|streams/[^/]+/(data|description|rejected)/[^/]+)"
+)
+_RESERVED_REQUEST_TOPIC_RE = re.compile(
+    r"\$aws/(certificates/create(-from-csr)?/[^/]+|provisioning-templates/[^/]+/provision/[^/]+"
+    r"|device_location/[^/]+/get_position_estimate|commands/[^/]+/[^/]+/executions/[^/]+/response/(json|cbor))"
+)
+
+# The reserved filters a client may subscribe to; a variable segment may be a "+".
+_RESERVED_FILTER_RE = re.compile(
+    r"\$aws/(things/.+|events/.+|sitewise/asset-models/[^/]+/assets/[^/]+/properties/[^/]+"
+    r"|certificates/create(-from-csr)?/[^/]+/(accepted|rejected)"
+    r"|provisioning-templates/[^/]+/provision/[^/]+/(accepted|rejected)"
+    r"|device_location/[^/]+/get_position_estimate/(accepted|rejected)"
+    r"|commands/[^/]+/[^/]+/executions/[^/]+/(request(/(json|cbor))?|response/(accepted|rejected)/(json|cbor)))"
+)
+
 
 def _reserved_topic_publish_allowed(topic: str) -> bool:
-    return not topic.startswith("$") or topic.startswith(RESERVED_PUBLISH_PREFIXES)
+    if not topic.startswith("$"):
+        return True
+    if topic.startswith(("$aws/rules/", "$aws/things/")):
+        return _RESERVED_REPLY_TOPIC_RE.fullmatch(topic) is None
+    return _RESERVED_REQUEST_TOPIC_RE.fullmatch(topic) is not None
+
+
+def _reserved_filter_subscribe_allowed(topic_filter: str) -> bool:
+    if topic_filter.startswith("$share/"):
+        # A shared subscription ($share/{ShareName}/{TopicFilter}) is held to the rule for its filter.
+        topic_filter = topic_filter.split("/", 2)[2] if topic_filter.count("/") >= 2 else ""
+    return not topic_filter.startswith("$") or _RESERVED_FILTER_RE.fullmatch(topic_filter) is not None
 
 
 _POLICY_VARIABLE_RE = re.compile(r"\$\{(iot:[A-Za-z.]+)\}")
@@ -9051,6 +9108,17 @@ def _mqtt_policy_allows(
     )
     variables = tuple(sorted(context.items()))
     return evaluate(ctx, [_parsed_iot_policy(doc, variables) for doc in documents]).decision == "Allow"
+
+
+def _mqtt_iam_allows(
+    account_id: str, region: str, credential: tuple[str, str], action: str, resource: str
+) -> bool:
+    """Whether the IAM policies of the key that signed a WebSocket session allow ``action`` on ``resource``."""
+    from ministack.core.iam_evaluator import enforce
+
+    access_key_id, key_account = credential
+    with request_scope(key_account, region):
+        return enforce(access_key_id, action, "iot", region, f"arn:aws:iot:{region}:{account_id}:{resource}") is None
 
 
 # ---------------------------------------------------------------------------
@@ -9697,6 +9765,9 @@ async def _handle_jobs_publish(
         return
 
     if verb == "start-next":
+        if error := _jobs_status_details_error(request.get("statusDetails")):
+            await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
+            return
         with request_scope(account_id, region):
             execution = jobs_start_next_execution(
                 thing, status_details=request.get("statusDetails"), peek=False
@@ -9896,11 +9967,11 @@ async def _handle_shadow_publish(
         )
 
     try:
-        request = json.loads(payload) if payload else {}
+        request = parse_shadow_request(payload) if payload else {}
     except (ValueError, UnicodeDecodeError):
         # All three request verbs reject malformed JSON, as on AWS — a `get`
         # or `delete` payload is optional but must parse when present.
-        await _respond(f"{verb}/rejected", _shadow_rejected(400, "invalid json"))
+        await _respond(f"{verb}/rejected", _shadow_rejected(400, "Payload contains invalid json"))
         return
     if not isinstance(request, dict):
         request = {}
@@ -10341,6 +10412,7 @@ RC5_NO_SUBSCRIPTION_EXISTED = 0x11
 RC5_MALFORMED_PACKET = 0x81
 RC5_NOT_AUTHORIZED = 0x87
 RC5_SESSION_TAKEN_OVER = 0x8E
+RC5_TOPIC_FILTER_INVALID = 0x8F
 RC5_TOPIC_NAME_INVALID = 0x90
 
 # Layout of the MQTT 5 SUBSCRIBE options byte (§3.8.3.1). MQTT 3.1.1 sends a
@@ -10769,6 +10841,7 @@ class _WSSession:
         self._send = send_coro
         self.account_id = account_id
         self.region = region
+        self._cleaned_up = False
         # The client certificate id or the IAM caller's user id, else the account:
         # lifecycle events' principalIdentifier and the rule SQL principal().
         self._principal = principal or account_id
@@ -10805,6 +10878,9 @@ class _WSSession:
         self.certificate_id: str | None = None
         # The template of a provisioning claim certificate, which has a policy of its own.
         self.provisioning_template: str | None = None
+        # The access key and account of an IAM principal that signed a WebSocket
+        # session; its IAM policies are evaluated under AUTH=true.
+        self.iam_credential: tuple[str, str] | None = None
         self._policy_context: dict = {}
 
     def disconnect_reason(self) -> str:
@@ -10813,7 +10889,7 @@ class _WSSession:
         Only the reasons the broker can actually tell apart are ever reported: a
         DISCONNECT packet (``CLIENT_INITIATED_DISCONNECT``), a takeover by a
         second connection using the same client id (``DUPLICATE_CLIENTID``),
-        a packet the certificate's policies refuse (``CLIENT_ERROR`` on 3.1.1,
+        a packet the session's policies refuse (``CLIENT_ERROR`` on 3.1.1,
         ``AUTH_ERROR`` on MQTT 5), and everything else — a transport that went
         away (``CONNECTION_LOST``).
         AWS's remaining reasons name machinery this broker does not have
@@ -10884,8 +10960,12 @@ class _WSSession:
             await self.deliver_to_client(reply_topic, json.dumps(doc).encode("utf-8"), max(granted))
 
     def _alloc_packet_id(self) -> int:
-        pid = self._next_pid
-        self._next_pid = (self._next_pid % 65535) + 1
+        # Skip identifiers still in flight: one id never names two messages at once.
+        for _ in range(65535):
+            pid = self._next_pid
+            self._next_pid = (self._next_pid % 65535) + 1
+            if pid not in self._in_flight:
+                return pid
         return pid
 
     def _ensure_retransmit_timer(self) -> None:
@@ -11016,13 +11096,15 @@ class _WSSession:
             )
 
     def _evaluates_policies(self) -> bool:
-        """Whether this session is held to its certificate's IoT policies (AUTH=true only)."""
+        """Whether this session is held to its certificate's IoT policies or its signer's IAM policies (AUTH=true)."""
         from ministack import app
 
-        return app.AUTH and self.certificate_id is not None
+        return app.AUTH and (self.certificate_id is not None or self.iam_credential is not None)
 
     def _policy_allows(self, action: str, resource: str) -> bool:
         """Whether this session may do ``action`` on ``resource``."""
+        if self._evaluates_policies() and self.iam_credential is not None:
+            return _mqtt_iam_allows(self.account_id, self.region, self.iam_credential, action, resource)
         return not self._evaluates_policies() or _mqtt_policy_allows(
             self.account_id,
             self.region,
@@ -11220,7 +11302,7 @@ class _WSSession:
                 self._will_retain = False
                 self._will_properties = b""
 
-            if self._evaluates_policies():
+            if self._evaluates_policies() and self.certificate_id is not None:
                 self._policy_context = _mqtt_policy_context(
                     self.account_id, self.region, self.certificate_id, client_id
                 )
@@ -11253,6 +11335,13 @@ class _WSSession:
                 if existing_ps is not None and not _is_session_expired(existing_ps):
                     session_present = True
                     self._session_identifier = existing_ps.session_identifier
+                    # Unacknowledged messages keep their packet identifiers: restore them before
+                    # a resubscription replays a retained message, so no new id collides with them.
+                    self._next_pid = existing_ps.next_packet_id
+                    # The resuming connection receives them only where its own policies allow it.
+                    self._in_flight.update({pid: msg for pid, msg in existing_ps.in_flight.items()
+                                            if self._policy_allows("iot:Receive", f"topic/{msg.topic}")})
+                    existing_ps.in_flight = {}
                     for topic_filter in existing_ps.subscriptions:
                         # A stored session keeps its topic filters, not the
                         # subscription options they were made with: those live
@@ -11272,11 +11361,7 @@ class _WSSession:
                     await self._send_connack(
                         session_present=True, assigned_client_id=assigned_client_id
                     )
-                    # Unacknowledged messages keep their packet identifiers and
-                    # go out again once their retransmit interval has passed.
-                    self._next_pid = existing_ps.next_packet_id
-                    self._in_flight.update(existing_ps.in_flight)
-                    existing_ps.in_flight = {}
+                    # They go out again once their retransmit interval has passed.
                     await self._retransmit_due()
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
@@ -11327,11 +11412,14 @@ class _WSSession:
                     await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
             if not _reserved_topic_publish_allowed(topic):
-                # AWS closes the connection without a PUBACK (measured over
-                # MQTT 3.1.1; the MQTT 5 reason code is not measured).
-                _broker_logger.warning("IoT broker: PUBLISH to a reserved topic closes the connection: %r", topic)
+                # Before the policy check: MQTT 5 answers a QoS 1 PUBLISH with
+                # PUBACK 0x90 and keeps the connection, 3.1.1 closes it.
+                _broker_logger.warning("IoT broker: PUBLISH to the reserved topic %r refused", topic)
                 if self.protocol_version == MQTT_5:
-                    await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
+                    if qos == 1 and packet_id is not None:
+                        await self.send_bytes(_make_puback(packet_id, reason_code=RC5_TOPIC_NAME_INVALID))
+                        return True
+                    await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
             if self.provisioning_template is not None and _mtls_claim_scope(self.certificate_id) is None:
                 # AWS acknowledges a PUBLISH on an expired claim's connection, then closes it.
@@ -11392,6 +11480,13 @@ class _WSSession:
                     raise ValueError("SUBSCRIBE topic filter without options byte")
                 subscription_options = body[off]
                 off += 1
+                if not _reserved_filter_subscribe_allowed(topic):
+                    # Before the policy check: 3.1.1 closes, MQTT 5 refuses this filter alone.
+                    _broker_logger.warning("IoT broker: SUBSCRIBE to the reserved filter %r refused", topic)
+                    if self.protocol_version != MQTT_5:
+                        return False
+                    granted.append(RC5_TOPIC_FILTER_INVALID)
+                    continue
                 if not self._policy_allows("iot:Subscribe", f"topicfilter/{topic}"):
                     # As on AWS: 3.1.1 closes, MQTT 5 refuses this filter alone.
                     _broker_logger.warning(
@@ -11513,6 +11608,11 @@ class _WSSession:
         return True
 
     async def cleanup(self) -> None:
+        # A takeover cleans the old connection up, and its own transport loop does again on exit:
+        # the second run must not overwrite the stored session with the evicted connection's state.
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
         if self._retransmit_task is not None and not self._retransmit_task.done():
             self._retransmit_task.cancel()
             try:
@@ -11603,6 +11703,25 @@ async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bo
             return False
 
 
+def _ws_handshake_check(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Under AUTH=true, the upgrade's verified IAM credential or the ``AuthError`` refusing it; else None."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import authenticate_handshake
+
+    return authenticate_handshake(scope) if AUTH else None
+
+
+async def _refuse_ws_handshake(scope: dict, send) -> None:
+    """Answer a refused upgrade with 403 and a trace id, the device gateway's answer to any credential failure."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": "Forbidden", "traceId": str(uuid.uuid4())}, separators=(",", ":")).encode()
+    await send({"type": "websocket.http.response.start", "status": 403,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
+
+
 async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
@@ -11620,6 +11739,13 @@ async def handle_websocket(
             sub_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
         except UnicodeDecodeError:
             sub_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+    checked = _ws_handshake_check(scope)
+    if isinstance(checked, AuthError):
+        await _refuse_ws_handshake(scope, send)
+        return
+    if checked is not None:
+        # The session belongs to the signing key's account, not the one guessed from the key id.
+        account_id = checked.account_id
     requested = sub_headers.get("sec-websocket-protocol", "")
     chosen = None
     for proto in [p.strip() for p in requested.split(",") if p.strip()]:
@@ -11636,8 +11762,12 @@ async def handle_websocket(
 
     ctx_token = _request_account_id.set(account_id)
     query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
-    principal = _caller_principal(extract_access_key_id(sub_headers, query))
+    # A verified signer names the session; an unverified credential only guesses one.
+    principal = _caller_principal(checked.access_key_id if checked is not None
+                                  else extract_access_key_id(sub_headers, query))
     session = _WSSession(send, account_id, region, principal)
+    if checked is not None:
+        session.iam_credential = (checked.access_key_id, checked.account_id)
     max_buffer = _max_frame_buffer_bytes()
 
     try:
